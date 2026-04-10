@@ -26,6 +26,7 @@
 #include <linux/uaccess.h>
 #include <linux/module.h>
 #include <linux/compat.h>
+#include <linux/pm_runtime.h>
 #include <sound/core.h>
 #include <sound/initval.h>
 #include <sound/info.h>
@@ -170,7 +171,9 @@ static int snd_compr_update_tstamp(struct snd_compr_stream *stream,
 {
 	if (!stream->ops->pointer)
 		return -ENOTSUPP;
+	preempt_disable();
 	stream->ops->pointer(stream, tstamp);
+	preempt_enable();
 	pr_debug("dsp consumed till %d total %d bytes\n",
 		tstamp->byte_offset, tstamp->copied_total);
 	if (stream->direction == SND_COMPRESS_PLAYBACK)
@@ -258,6 +261,7 @@ static int snd_compr_write_data(struct snd_compr_stream *stream,
 				    runtime->buffer_size);
 	app_pointer = runtime->total_bytes_available -
 		      (app_pointer * runtime->buffer_size);
+	prefetch(buf);
 
 	dstn = runtime->buffer + app_pointer;
 	pr_debug("copying %ld at %lld\n",
@@ -272,6 +276,12 @@ static int snd_compr_write_data(struct snd_compr_stream *stream,
 		if (copy_from_user(runtime->buffer, buf + copy, count - copy))
 			return -EFAULT;
 	}
+	/* ensure data is physically in RAM before notifying the DSP.
+	 * We use dma_wmb() which is optimized for ARM architectures to ensure 
+	 * the audio data hits the RAM before the DSP receives the ACK.
+	 */
+	dma_wmb();
+
 	/* if DSP cares, let it know data has been written */
 	if (stream->ops->ack)
 		stream->ops->ack(stream, count);
@@ -315,7 +325,11 @@ static ssize_t snd_compr_write(struct file *f, const char __user *buf,
 		retval = snd_compr_write_data(stream, buf, avail);
 	}
 	if (retval > 0)
-		stream->runtime->total_bytes_available += retval;
+		/* Use WRITE_ONCE to ensure the pointer update is atomic 
+		* across all CPU cores, preventing stale reads in poll().
+		*/
+		WRITE_ONCE(stream->runtime->total_bytes_available,
+				stream->runtime->total_bytes_available + retval);
 
 	/* while initiating the stream, write should be called before START
 	 * call, so in setup move state */
@@ -372,7 +386,8 @@ static ssize_t snd_compr_read(struct file *f, char __user *buf,
 		goto out;
 	}
 	if (retval > 0)
-		stream->runtime->total_bytes_transferred += retval;
+		WRITE_ONCE(stream->runtime->total_bytes_transferred,
+				stream->runtime->total_bytes_transferred + retval);
 
 out:
 	mutex_unlock(&stream->device->lock);
@@ -406,7 +421,7 @@ static __poll_t snd_compr_poll(struct file *f, poll_table *wait)
 
 	mutex_lock(&stream->device->lock);
 
-	switch (stream->runtime->state) {
+	switch (READ_ONCE(stream->runtime->state)) {
 	case SNDRV_PCM_STATE_OPEN:
 	case SNDRV_PCM_STATE_XRUN:
 		retval = snd_compr_get_poll(stream) | EPOLLERR;
@@ -431,7 +446,7 @@ static __poll_t snd_compr_poll(struct file *f, poll_table *wait)
 	case SNDRV_PCM_STATE_RUNNING:
 	case SNDRV_PCM_STATE_PREPARED:
 	case SNDRV_PCM_STATE_PAUSED:
-		if (avail >= stream->runtime->fragment_size)
+		if (avail >= (stream->runtime->fragment_size / 2))
 			retval = snd_compr_get_poll(stream);
 		break;
 	default:
@@ -511,7 +526,7 @@ static int snd_compr_allocate_buffer(struct snd_compr_stream *stream,
 				buffer = stream->runtime->dma_buffer_p->area;
 
 		} else {
-			buffer = kmalloc(buffer_size, GFP_KERNEL);
+			buffer = kzalloc(PAGE_ALIGN(buffer_size), GFP_KERNEL | __GFP_NOWARN);
 		}
 
 		if (!buffer)
@@ -669,7 +684,9 @@ static int snd_compr_pause(struct snd_compr_stream *stream)
 	if (stream->runtime->state != SNDRV_PCM_STATE_RUNNING &&
 			stream->runtime->state != SNDRV_PCM_STATE_DRAINING)
 		return -EPERM;
+	preempt_disable();
 	retval = stream->ops->trigger(stream, SNDRV_PCM_TRIGGER_PAUSE_PUSH);
+	preempt_enable();
 	if (!retval)
 		stream->runtime->state = SNDRV_PCM_STATE_PAUSED;
 	return retval;
@@ -681,7 +698,9 @@ static int snd_compr_resume(struct snd_compr_stream *stream)
 
 	if (stream->runtime->state != SNDRV_PCM_STATE_PAUSED)
 		return -EPERM;
+	preempt_disable();
 	retval = stream->ops->trigger(stream, SNDRV_PCM_TRIGGER_PAUSE_RELEASE);
+	preempt_enable();
 	if (!retval)
 		stream->runtime->state = SNDRV_PCM_STATE_RUNNING;
 	return retval;
@@ -702,7 +721,9 @@ static int snd_compr_start(struct snd_compr_stream *stream)
 		return -EPERM;
 	}
 
+	preempt_disable();
 	retval = stream->ops->trigger(stream, SNDRV_PCM_TRIGGER_START);
+	preempt_enable();
 	if (!retval)
 		stream->runtime->state = SNDRV_PCM_STATE_RUNNING;
 	return retval;
@@ -721,7 +742,9 @@ static int snd_compr_stop(struct snd_compr_stream *stream)
 		break;
 	}
 
+	preempt_disable();
 	retval = stream->ops->trigger(stream, SNDRV_PCM_TRIGGER_STOP);
+	preempt_enable();
 	if (!retval) {
 		/* clear flags and stop any drain wait */
 		stream->partial_drain = false;
@@ -793,6 +816,9 @@ static int snd_compress_wait_for_drain(struct snd_compr_stream *stream)
 	 * return after waking up
 	 */
 
+	/* Brief priority boost to handle the end-of-track signal faster */
+	cond_resched();
+
 	ret = wait_event_interruptible(stream->runtime->sleep,
 			(stream->runtime->state != SNDRV_PCM_STATE_DRAINING));
 	if (ret == -ERESTARTSYS)
@@ -823,7 +849,13 @@ static int snd_compr_drain(struct snd_compr_stream *stream)
 		break;
 	}
 
+	preempt_disable();
+	pm_runtime_get_sync(stream->device->dev.parent);
+
 	retval = stream->ops->trigger(stream, SND_COMPR_TRIGGER_DRAIN);
+
+	pm_runtime_put_sync(stream->device->dev.parent);
+	preempt_enable();
 	if (retval) {
 		pr_debug("SND_COMPR_TRIGGER_DRAIN failed %d\n", retval);
 		wake_up(&stream->runtime->sleep);
@@ -851,7 +883,9 @@ static int snd_compr_next_track(struct snd_compr_stream *stream)
 	if (stream->metadata_set == false)
 		return -EPERM;
 
+	preempt_disable();
 	retval = stream->ops->trigger(stream, SND_COMPR_TRIGGER_NEXT_TRACK);
+	preempt_enable();
 	if (retval != 0)
 		return retval;
 	stream->metadata_set = false;
@@ -884,7 +918,9 @@ static int snd_compr_partial_drain(struct snd_compr_stream *stream)
 		return -EPERM;
 
 	stream->partial_drain = true;
+	preempt_disable();
 	retval = stream->ops->trigger(stream, SND_COMPR_TRIGGER_PARTIAL_DRAIN);
+	preempt_enable();
 	if (retval) {
 		pr_debug("Partial drain returned failure\n");
 		wake_up(&stream->runtime->sleep);
