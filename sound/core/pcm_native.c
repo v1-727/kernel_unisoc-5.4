@@ -544,6 +544,13 @@ static int period_to_usecs(struct snd_pcm_runtime *runtime)
 	if (! runtime->rate)
 		return -1; /* invalid */
 
+	/* * For rates above 96kHz, we request 0us latency
+	 * to prevent the CPU from entering deep sleep states
+	 * that cause jitter during playback.
+	 */
+	if (runtime->rate > 96000)
+		return 0;
+
 	/* take 75% of period time as the deadline */
 	usecs = (750000 / runtime->rate) * runtime->period_size;
 	usecs += ((750000 % runtime->rate) * runtime->period_size) /
@@ -2684,6 +2691,14 @@ static int snd_pcm_release(struct inode *inode, struct file *file)
 		return -ENXIO;
 	pcm = substream->pcm;
 	mutex_lock(&pcm->open_mutex);
+
+	/* * If the stream was running, give the hardware 
+	 * a few milliseconds to settle the analog stages before 
+	 * full power-down.
+	 */
+	if (substream->runtime && substream->runtime->status->state != SNDRV_PCM_STATE_OPEN)
+		msleep(5);
+
 	snd_pcm_release_substream(substream);
 	kfree(pcm_file);
 	mutex_unlock(&pcm->open_mutex);
@@ -2698,7 +2713,7 @@ static int snd_pcm_release(struct inode *inode, struct file *file)
  */
 static int do_pcm_hwsync(struct snd_pcm_substream *substream)
 {
-	switch (substream->runtime->status->state) {
+	switch (READ_ONCE(substream->runtime->status->state)) {
 	case SNDRV_PCM_STATE_DRAINING:
 		if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
 			return -EBADFD;
@@ -2843,6 +2858,10 @@ static int snd_pcm_sync_ptr(struct snd_pcm_substream *substream,
 		if (err < 0)
 			return err;
 	}
+
+	/* Ensure all memory writes are visible before 
+	 * syncing the hardware pointer with userspace. */
+	mb();
 	snd_pcm_stream_lock_irq(substream);
 	if (!(sync_ptr.flags & SNDRV_PCM_SYNC_PTR_APPL)) {
 		err = pcm_lib_apply_appl_ptr(substream,
